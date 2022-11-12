@@ -4,6 +4,7 @@ use std::{
     io::{Read, Write},
 };
 
+use rusqlite::ToSql;
 use serde::Deserialize;
 
 pub mod errors;
@@ -187,11 +188,12 @@ async fn download<P: AsRef<std::path::Path>>(url: &str, path: P) -> Result<(), G
 
 async fn get_db_files<P: AsRef<std::path::Path>>(dbf_path: P) -> Result<(), GLErr> {
     let dbf_path = dbf_path.as_ref();
-    std::fs::create_dir_all(&dbf_path)?;
+    std::fs::create_dir_all(dbf_path)?;
+    let key = std::env::var("MAXMIND_KEY")?;
     // Countries
     let perma = format!(
         "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-Country-CSV&license_key={}&suffix=zip",
-        std::env::var("MAXMIND_KEY")?,
+        key,
     );
     let countriesf = dbf_path.join("countries.zip");
     download(perma.as_str(), &countriesf).await?;
@@ -203,7 +205,7 @@ async fn get_db_files<P: AsRef<std::path::Path>>(dbf_path: P) -> Result<(), GLEr
     // Cities
     let perma = format!(
         "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City-CSV&license_key={}&suffix=zip",
-        std::env::var("MAXMIND_KEY")?,
+        key,
     );
     let citiesf = dbf_path.join("cities.zip");
     download(perma.as_str(), &citiesf).await?;
@@ -214,7 +216,7 @@ async fn get_db_files<P: AsRef<std::path::Path>>(dbf_path: P) -> Result<(), GLEr
     // ASN
     let perma = format!(
         "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-ASN-CSV&license_key={}&suffix=zip",
-        std::env::var("MAXMIND_KEY")?,
+        key,
     );
     let asnf = dbf_path.join("asn.zip");
     download(perma.as_str(), &asnf).await?;
@@ -223,6 +225,12 @@ async fn get_db_files<P: AsRef<std::path::Path>>(dbf_path: P) -> Result<(), GLEr
     z.extract(&dbf_path.join("asn"))?;
 
     // Unzip
+    Ok(())
+}
+
+fn execute_query(db: String, q: &str, params: &[&dyn ToSql]) -> Result<(), GLErr> {
+    let conn = rusqlite::Connection::open(&db)?;
+    conn.execute(q, params)?;
     Ok(())
 }
 
@@ -259,18 +267,13 @@ async fn countries_from_csv<P: AsRef<std::path::Path>>(
     db: String,
 ) -> Result<(), GLErr> {
     let cdir = dbfiles.as_ref().join(std::path::Path::new("countries"));
-    let mut path: Option<std::path::PathBuf> = None;
-    for p in std::fs::read_dir(&cdir)? {
-        match p {
-            Ok(de) => path = Some(de.path()),
+    let mut path = if let Some(v) = (std::fs::read_dir(&cdir)?).next() {
+        match v {
+            Ok(p) => p.path(),
             Err(e) => return Err(GLErr::IOErr(e)),
-        };
-        break;
-    }
-    let mut path = if let Some(p) = path {
-        p
+        }
     } else {
-        return Err(GLErr::ZipExtractError);
+        return Err(GLErr::ZipExtractErr);
     };
 
     // Countries
@@ -286,8 +289,7 @@ async fn countries_from_csv<P: AsRef<std::path::Path>>(
         let mut count: usize = 0;
         let batch_size: usize = 5000;
         let db = db1;
-        fn execute(cities: &Vec<Country>, db: String) {
-            let conn = rusqlite::Connection::open(&db).unwrap();
+        fn execute(cities: &[Country], db: String) {
             let mut values = Vec::<String>::new();
             let mut params = Vec::<&dyn rusqlite::ToSql>::new();
             let mut q = String::from(
@@ -306,15 +308,20 @@ async fn countries_from_csv<P: AsRef<std::path::Path>>(
                 params.push(&c.is_in_european_union);
             }
             q = format!("{} {}", q, values.join(","));
-            let _ = conn.execute(&q, params.as_slice());
+            match execute_query(db, &q, params.as_slice()) {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("{:?}", e);
+                }
+            }
         }
-        while let Some(city) = rx.recv().await {
+        while let Some(country) = rx.recv().await {
             if count == batch_size {
                 execute(&countries, db.clone());
                 countries = Vec::<Country>::new();
                 count = 0;
             }
-            match city {
+            match country {
                 Some(v) => {
                     countries.push(v);
                     count += 1;
@@ -348,8 +355,7 @@ async fn countries_from_csv<P: AsRef<std::path::Path>>(
         let mut count: usize = 0;
         let batch_size: usize = 20000;
         let db = db1;
-        fn execute(countries: &Vec<CountryIPv4>, db: String) {
-            let conn = rusqlite::Connection::open(&db).unwrap();
+        fn execute(countries: &[CountryIPv4], db: String) {
             let mut values = Vec::<String>::new();
             let mut params = Vec::<&dyn rusqlite::ToSql>::new();
             let mut q = String::from(
@@ -366,7 +372,12 @@ async fn countries_from_csv<P: AsRef<std::path::Path>>(
                 params.push(&c.is_satellite_provider);
             }
             q = format!("{} {}", q, values.join(","));
-            let _ = conn.execute(&q, params.as_slice());
+            match execute_query(db, &q, params.as_slice()) {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("{:?}", e);
+                }
+            }
         }
         while let Some(country4) = rx.recv().await {
             if count == batch_size {
@@ -408,8 +419,7 @@ async fn countries_from_csv<P: AsRef<std::path::Path>>(
         let mut count: usize = 0;
         let batch_size: usize = 20000;
         let db = db1;
-        fn execute(countries: &Vec<CountryIPv6>, db: String) {
-            let conn = rusqlite::Connection::open(&db).unwrap();
+        fn execute(countries: &[CountryIPv6], db: String) {
             let mut values = Vec::<String>::new();
             let mut params = Vec::<&dyn rusqlite::ToSql>::new();
             let mut q = String::from(
@@ -426,7 +436,12 @@ async fn countries_from_csv<P: AsRef<std::path::Path>>(
                 params.push(&c.is_satellite_provider);
             }
             q = format!("{} {}", q, values.join(","));
-            let _ = conn.execute(&q, params.as_slice());
+            match execute_query(db, &q, params.as_slice()) {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("{:?}", e);
+                }
+            };
         }
         while let Some(country4) = rx.recv().await {
             if count == batch_size {
@@ -502,18 +517,13 @@ struct CityIPv6 {
 
 async fn cities_from_csv<P: AsRef<std::path::Path>>(dbfiles: P, db: String) -> Result<(), GLErr> {
     let cdir = dbfiles.as_ref().join(std::path::Path::new("cities"));
-    let mut path: Option<std::path::PathBuf> = None;
-    for p in std::fs::read_dir(&cdir)? {
-        match p {
-            Ok(de) => path = Some(de.path()),
+    let mut path = if let Some(v) = (std::fs::read_dir(&cdir)?).next() {
+        match v {
+            Ok(p) => p.path(),
             Err(e) => return Err(GLErr::IOErr(e)),
-        };
-        break;
-    }
-    let mut path = if let Some(p) = path {
-        p
+        }
     } else {
-        return Err(GLErr::ZipExtractError);
+        return Err(GLErr::ZipExtractErr);
     };
 
     // City
@@ -529,8 +539,7 @@ async fn cities_from_csv<P: AsRef<std::path::Path>>(dbfiles: P, db: String) -> R
         let mut count: usize = 0;
         let batch_size: usize = 5000;
         let db = db1;
-        fn execute(cities: &Vec<City>, db: String) {
-            let conn = rusqlite::Connection::open(&db).unwrap();
+        fn execute(cities: &[City], db: String) {
             let mut values = Vec::<String>::new();
             let mut params = Vec::<&dyn rusqlite::ToSql>::new();
             let mut q = String::from(
@@ -558,7 +567,12 @@ async fn cities_from_csv<P: AsRef<std::path::Path>>(dbfiles: P, db: String) -> R
                 params.push(&c.is_in_european_union);
             }
             q = format!("{} {}", q, values.join(","));
-            let _ = conn.execute(&q, params.as_slice());
+            match execute_query(db, &q, params.as_slice()) {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("{:?}", e);
+                }
+            }
         }
         while let Some(city) = rx.recv().await {
             if count == batch_size {
@@ -600,8 +614,7 @@ async fn cities_from_csv<P: AsRef<std::path::Path>>(dbfiles: P, db: String) -> R
         let mut count: usize = 0;
         let batch_size: usize = 100000;
         let db = db1;
-        fn execute(cities: &Vec<CityIPv4>, db: String) {
-            let conn = rusqlite::Connection::open(&db).unwrap();
+        fn execute(cities: &[CityIPv4], db: String) {
             let mut values = Vec::<String>::new();
             let mut params = Vec::<&dyn rusqlite::ToSql>::new();
             let mut q = String::from(
@@ -623,7 +636,12 @@ async fn cities_from_csv<P: AsRef<std::path::Path>>(dbfiles: P, db: String) -> R
                 params.push(&c.accuracy_radius);
             }
             q = format!("{} {}", q, values.join(","));
-            let _ = conn.execute(&q, params.as_slice());
+            match execute_query(db, &q, params.as_slice()) {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("{:?}", e);
+                }
+            }
         }
         while let Some(city4) = rx.recv().await {
             if count == batch_size {
@@ -665,8 +683,7 @@ async fn cities_from_csv<P: AsRef<std::path::Path>>(dbfiles: P, db: String) -> R
         let mut count: usize = 0;
         let batch_size: usize = 100000;
         let db = db1;
-        fn execute(cities: &Vec<CityIPv6>, db: String) {
-            let conn = rusqlite::Connection::open(&db).unwrap();
+        fn execute(cities: &[CityIPv6], db: String) {
             let mut values = Vec::<String>::new();
             let mut params = Vec::<&dyn rusqlite::ToSql>::new();
             let mut q = String::from(
@@ -688,15 +705,20 @@ async fn cities_from_csv<P: AsRef<std::path::Path>>(dbfiles: P, db: String) -> R
                 params.push(&c.accuracy_radius);
             }
             q = format!("{} {}", q, values.join(","));
-            let _ = conn.execute(&q, params.as_slice());
+            match execute_query(db, &q, params.as_slice()) {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("{:?}", e);
+                }
+            }
         }
-        while let Some(city4) = rx.recv().await {
+        while let Some(city) = rx.recv().await {
             if count == batch_size {
                 execute(&cities, db.clone());
                 cities = Vec::<CityIPv6>::new();
                 count = 0;
             }
-            match city4 {
+            match city {
                 Some(v) => {
                     cities.push(v);
                     count += 1;
@@ -736,18 +758,13 @@ struct ASN6 {
 
 async fn asn_from_csv<P: AsRef<std::path::Path>>(dbfiles: P, db: String) -> Result<(), GLErr> {
     let cdir = dbfiles.as_ref().join(std::path::Path::new("asn"));
-    let mut path: Option<std::path::PathBuf> = None;
-    for p in std::fs::read_dir(&cdir)? {
-        match p {
-            Ok(de) => path = Some(de.path()),
+    let mut path = if let Some(v) = (std::fs::read_dir(&cdir)?).next() {
+        match v {
+            Ok(p) => p.path(),
             Err(e) => return Err(GLErr::IOErr(e)),
-        };
-        break;
-    }
-    let mut path = if let Some(p) = path {
-        p
+        }
     } else {
-        return Err(GLErr::ZipExtractError);
+        return Err(GLErr::ZipExtractErr);
     };
 
     // ipv4
@@ -763,8 +780,7 @@ async fn asn_from_csv<P: AsRef<std::path::Path>>(dbfiles: P, db: String) -> Resu
         let mut count: usize = 0;
         let batch_size: usize = 100000;
         let db = db1;
-        fn execute(asns: &Vec<ASN4>, db: String) {
-            let conn = rusqlite::Connection::open(&db).unwrap();
+        fn execute(asns: &[ASN4], db: String) {
             let mut values = Vec::<String>::new();
             let mut params = Vec::<&dyn rusqlite::ToSql>::new();
             let mut q = String::from(
@@ -779,7 +795,12 @@ async fn asn_from_csv<P: AsRef<std::path::Path>>(dbfiles: P, db: String) -> Resu
                 params.push(&a.autonomous_system_organization);
             }
             q = format!("{} {}", q, values.join(","));
-            let _ = conn.execute(&q, params.as_slice());
+            match execute_query(db, &q, params.as_slice()) {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("{:?}", e);
+                }
+            }
         }
         while let Some(asn) = rx.recv().await {
             if count == batch_size {
@@ -821,8 +842,7 @@ async fn asn_from_csv<P: AsRef<std::path::Path>>(dbfiles: P, db: String) -> Resu
         let mut count: usize = 0;
         let batch_size: usize = 100000;
         let db = db1;
-        fn execute(asns: &Vec<ASN6>, db: String) {
-            let conn = rusqlite::Connection::open(&db).unwrap();
+        fn execute(asns: &[ASN6], db: String) {
             let mut values = Vec::<String>::new();
             let mut params = Vec::<&dyn rusqlite::ToSql>::new();
             let mut q = String::from(
@@ -837,7 +857,12 @@ async fn asn_from_csv<P: AsRef<std::path::Path>>(dbfiles: P, db: String) -> Resu
                 params.push(&a.autonomous_system_organization);
             }
             q = format!("{} {}", q, values.join(","));
-            let _ = conn.execute(&q, params.as_slice());
+            match execute_query(db, &q, params.as_slice()) {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("{:?}", e);
+                }
+            }
         }
         while let Some(asn) = rx.recv().await {
             if count == batch_size {
@@ -886,7 +911,11 @@ async fn new_db<P: AsRef<std::path::Path>>(db_dir: P) -> Result<(), GLErr> {
 
     let dbfile = db_dir.join("geolite2.db.new");
     let conn = rusqlite::Connection::open(&dbfile)?;
-    let db = dbfile.into_os_string().into_string().unwrap();
+    let db = if let Ok(s) = dbfile.into_os_string().into_string() {
+        s
+    } else {
+        return Err(GLErr::OSStringErr);
+    };
     build_tables(&conn)?;
     countries_from_csv(&dbfiles, db.clone()).await?;
     cities_from_csv(&dbfiles, db.clone()).await?;
@@ -898,7 +927,7 @@ async fn update_db() -> Result<(), GLErr> {
     // Update new version
     let dbd = std::env::var("GL2_DBDIR")?;
     let db_dir = std::path::Path::new(&dbd);
-    if !update_needed(&db_dir) {
+    if !update_needed(db_dir) {
         eprintln!("No update needed");
         return Ok(());
     }
@@ -929,16 +958,16 @@ async fn update_db() -> Result<(), GLErr> {
     Ok(())
 }
 
-fn phone_codes() -> HashMap<String, String> {
-    let var = std::env::var("PHONE_JSON_FILE").unwrap();
-    let json_string = std::fs::read_to_string(&var).unwrap();
-    let h: HashMap<String, String> = serde_json::from_str(&json_string).unwrap();
-    h
+fn phone_codes() -> Result<HashMap<String, String>, GLErr> {
+    let var = std::env::var("PHONE_JSON_FILE")?;
+    let json_string = std::fs::read_to_string(&var)?;
+    let h: HashMap<String, String> = serde_json::from_str(&json_string)?;
+    Ok(h)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), GLErr> {
-    let _pcodes = phone_codes();
+    let _pcodes = phone_codes()?;
     update_db().await?;
     Ok(())
 }
